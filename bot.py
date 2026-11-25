@@ -39,7 +39,7 @@ COMMANDS = [
 
 
 async def on_error(event: ErrorEvent) -> bool:
-    log.error("Handler error: %s", type(event.exception).__name__, exc_info=event.exception)
+    log.error("Handler error: %s: %s", type(event.exception).__name__, str(event.exception)[:200], exc_info=event.exception)
     text = "⚠️ একটি সমস্যা হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।"
     update = event.update
     try:

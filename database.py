@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from pathlib import Path
 from typing import Optional
@@ -18,6 +19,26 @@ FROM providers p JOIN provider_configs c ON c.provider_id = p.id
 """
 
 
+RETRYABLE = (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, ConnectionError, OSError)
+
+
+def _retry(fn):
+    """সংযোগ-সংক্রান্ত সাময়িক ত্রুটিতে সর্বোচ্চ ৩ বার চেষ্টা করে।"""
+
+    @functools.wraps(fn)
+    async def wrapper(self, *args, **kwargs):
+        for attempt in (1, 2, 3):
+            try:
+                return await fn(self, *args, **kwargs)
+            except RETRYABLE as exc:
+                if attempt == 3:
+                    raise
+                log.warning("DB connection error (%s), retry %s", type(exc).__name__, attempt)
+                await asyncio.sleep(0.4 * attempt)
+
+    return wrapper
+
+
 class Database:
     def __init__(self, dsn: str):
         self.dsn = dsn
@@ -27,7 +48,10 @@ class Database:
         last: Optional[Exception] = None
         for attempt in range(1, 6):
             try:
-                self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5, command_timeout=15)
+                self.pool = await asyncpg.create_pool(
+                    self.dsn, min_size=1, max_size=5, command_timeout=15,
+                    max_inactive_connection_lifetime=20,
+                )
                 break
             except (OSError, asyncpg.PostgresError) as exc:
                 last = exc
@@ -68,6 +92,7 @@ class Database:
         return (time.monotonic() - started) * 1000
 
     # ---- users / settings / audit ----
+    @_retry
     async def touch_user(self, tg_id: int, username, first_name, is_owner: bool) -> None:
         await self.pool.execute(
             """INSERT INTO users (telegram_id, username, first_name, is_owner)
@@ -77,6 +102,7 @@ class Database:
             tg_id, username, first_name, is_owner,
         )
 
+    @_retry
     async def set_setting(self, key: str, value: str) -> None:
         await self.pool.execute(
             """INSERT INTO settings (key, value) VALUES ($1,$2)
@@ -84,17 +110,20 @@ class Database:
             key, value,
         )
 
+    @_retry
     async def audit(self, user_id: Optional[int], action: str, detail: Optional[str] = None) -> None:
         await self.pool.execute(
             "INSERT INTO audit_logs (user_id, action, detail) VALUES ($1,$2,$3)", user_id, action, detail
         )
 
+    @_retry
     async def audit_recent(self, limit: int = 5):
         return await self.pool.fetch(
             "SELECT user_id, action, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT $1", limit
         )
 
     # ---- providers ----
+    @_retry
     async def sync_providers(self, providers) -> None:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -116,18 +145,22 @@ class Database:
                             "UPDATE provider_configs SET enabled=FALSE WHERE provider_id=$1", pid
                         )
 
+    @_retry
     async def list_providers(self):
         return await self.pool.fetch(LIST_SQL + " ORDER BY p.position")
 
+    @_retry
     async def get_provider(self, slug: str):
         return await self.pool.fetchrow(LIST_SQL + " WHERE p.slug=$1", slug)
 
+    @_retry
     async def get_secret(self, slug: str):
         return await self.pool.fetchrow(
             """SELECT c.base_url, c.api_key_enc FROM provider_configs c
                JOIN providers p ON p.id=c.provider_id WHERE p.slug=$1""", slug,
         )
 
+    @_retry
     async def save_config(self, slug, base_url, key_enc, key_hint, status, error, user_id) -> None:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -139,12 +172,14 @@ class Database:
                     slug, base_url, key_enc, key_hint, status, error, user_id,
                 )
 
+    @_retry
     async def set_enabled(self, slug: str, enabled: bool) -> None:
         await self.pool.execute(
             """UPDATE provider_configs c SET enabled=$2, updated_at=now()
                FROM providers p WHERE p.id=c.provider_id AND p.slug=$1""", slug, enabled,
         )
 
+    @_retry
     async def delete_key(self, slug: str) -> None:
         await self.pool.execute(
             """UPDATE provider_configs c SET api_key_enc=NULL, api_key_hint=NULL, enabled=FALSE,
@@ -152,6 +187,7 @@ class Database:
                FROM providers p WHERE p.id=c.provider_id AND p.slug=$1""", slug,
         )
 
+    @_retry
     async def update_status(self, slug: str, status: str, error: Optional[str]) -> None:
         await self.pool.execute(
             """UPDATE provider_configs c SET connection_status=$2, last_error=$3,
@@ -160,6 +196,7 @@ class Database:
         )
 
     # ---- request logs ----
+    @_retry
     async def log_request(self, user_id, slug, action, success, http_status, duration_ms, error_code) -> None:
         await self.pool.execute(
             """INSERT INTO request_logs (user_id, provider_id, action, success, http_status, duration_ms, error_code)
@@ -167,9 +204,11 @@ class Database:
             user_id, slug, action, success, http_status, duration_ms, error_code,
         )
 
+    @_retry
     async def history_count(self) -> int:
         return await self.pool.fetchval("SELECT count(*) FROM request_logs")
 
+    @_retry
     async def history(self, page: int, size: int):
         return await self.pool.fetch(
             """SELECT p.name, r.action, r.success, r.http_status, r.duration_ms, r.created_at
@@ -177,9 +216,11 @@ class Database:
                ORDER BY r.id DESC LIMIT $1 OFFSET $2""", size, page * size,
         )
 
+    @_retry
     async def last_activity(self):
         return await self.pool.fetchval("SELECT max(created_at) FROM request_logs")
 
+    @_retry
     async def stats_24h(self):
         return await self.pool.fetch(
             """SELECT p.slug, count(*) FILTER (WHERE r.success) AS ok,
